@@ -18,6 +18,8 @@ import org.jetbrains.kotlin.fir.references.impl.FirExplicitThisReference
 import org.jetbrains.kotlin.fir.references.impl.FirImplicitThisReference
 import org.jetbrains.kotlin.fir.references.impl.FirPropertyFromParameterResolvedNamedReference
 import org.jetbrains.kotlin.fir.types.FirResolvedTypeRef
+import org.jetbrains.kotlin.fir.types.FirTypeProjection
+import org.jetbrains.kotlin.fir.types.isNullableAny
 import org.jetbrains.kotlin.fir.visitors.CompositeTransformResult
 import org.jetbrains.kotlin.fir.visitors.FirVisitor
 import org.jetbrains.kotlin.lexer.KtTokens
@@ -96,13 +98,13 @@ class FirTreeBuilder(val factory : Factory, val session: FirSession) : FirVisito
                     compilationUnit.addDeclaredType(t)
                 }
                 is CtTypeMember -> { // Top level function or property declaration
-                    val topLvl = pkg.getType<CtType<Any>>(toplvlClassName) ?: factory.Core().createClass<Any>()
-                        .also { topLvlClass ->
+                    val topLvl = pkg.getType<CtType<Any>>(toplvlClassName) ?: (factory.Core().createClass<Any>().also {
+                            topLvlClass ->
                             topLvlClass.setImplicit<CtClass<*>>(true)
                             topLvlClass.setSimpleName<CtClass<*>>(toplvlClassName)
                             pkg.addType<CtPackage>(topLvlClass)
                             compilationUnit.addDeclaredType(topLvlClass)
-                        }
+                        })
                     topLvl.addTypeMember<CtClass<Any>>(t)
                 }
             }
@@ -126,6 +128,12 @@ class FirTreeBuilder(val factory : Factory, val session: FirSession) : FirVisito
         // Modifiers
         val modifierList = KtModifierKind.fromClass(regularClass)
         addModifiersAsMetadata(type, modifierList)
+
+        // Type parameters
+        if(regularClass.typeParameters.isNotEmpty()) {
+            type.setFormalCtTypeParameters<CtType<*>>(
+                regularClass.typeParameters.map { visitTypeParameter(it,null).single })
+        }
 
         val decls = regularClass.declarations.map {
             it.accept(this, null).single.also { decl ->
@@ -339,6 +347,13 @@ class FirTreeBuilder(val factory : Factory, val session: FirSession) : FirVisito
         return ctAssignment.compose()
     }
 
+    override fun visitTypeProjection(
+        typeProjection: FirTypeProjection,
+        data: Nothing?
+    ): CompositeTransformResult.Single<CtTypeReference<*>> {
+        return referenceBuilder.visitTypeProjection(typeProjection).compose()
+    }
+
     private fun visitNormalFunctionCall(call: InvocationType.NORMAL_CALL):
             CompositeTransformResult<CtInvocation<*>> {
         val (firReceiver, functionCall) = call
@@ -360,6 +375,12 @@ class FirTreeBuilder(val factory : Factory, val session: FirSession) : FirVisito
             invocation.setArguments<CtInvocation<Any>>(functionCall.arguments.map {
                 expressionOrWrappedInStatementExpression(it.accept(this,null).single)
             })
+        }
+
+        if(functionCall.typeArguments.isNotEmpty()) {
+            invocation.setActualTypeArguments<CtInvocation<*>>(
+                functionCall.typeArguments.map { visitTypeProjection(it, null).single }
+            )
         }
 
         invocation.putMetadata<CtInvocation<*>>(KtMetadataKeys.ACCESS_IS_SAFE, functionCall.safe)
@@ -400,11 +421,14 @@ class FirTreeBuilder(val factory : Factory, val session: FirSession) : FirVisito
 
     private fun visitBinaryOperatorViaFunctionCall(binType: InvocationType.BINARY_OPERATOR):
             CompositeTransformResult.Single<CtBinaryOperator<*>> {
-        val (firLhs, kind, firRhs, opFunc) = binType
+        val firLhs = binType.lhs
+        val kind = binType.kind
+        val firRhs = binType.rhs
+        val opFunc = binType.originalFunction
         val ktOp = factory.Core().createBinaryOperator<Any>()
-        val lhs = firLhs.accept(this,null).single
+        val lhs = firLhs?.accept(this,null)?.single
         val rhs = firRhs.accept(this,null).single
-        ktOp.setLeftHandOperand<CtBinaryOperator<Any>>(lhs as CtExpression<*>)
+        ktOp.setLeftHandOperand<CtBinaryOperator<Any>>(lhs as CtExpression<*>?)
         ktOp.setRightHandOperand<CtBinaryOperator<Any>>(rhs as CtExpression<*>)
         ktOp.setType<CtBinaryOperator<Any>>(referenceBuilder.getNewTypeReference(opFunc.typeRef))
 
@@ -446,7 +470,7 @@ class FirTreeBuilder(val factory : Factory, val session: FirSession) : FirVisito
     }
 
     override fun visitWhenExpression(whenExpression: FirWhenExpression, data: Nothing?): CompositeTransformResult<CtElement> {
-        if(whenExpression.isIf()) return visitIfExpression(whenExpression)
+        if(whenExpression.isIf()) return visitIfExpression(whenExpression) // FIXME prob wrong for no arg
         val subjectVariable = whenExpression.subjectVariable
         if(subjectVariable?.name?.isSpecial == true) {
             if(subjectVariable.name.asString() == "<elvis>")
@@ -455,14 +479,68 @@ class FirTreeBuilder(val factory : Factory, val session: FirSession) : FirVisito
                 "Unexpected special in subject variable of when-expression: ${subjectVariable.name.asString()}")
         }
 
-        return super.visitWhenExpression(whenExpression, data)
+        val ctSwitch = if(helper.whenIsStatement(whenExpression)) {
+            factory.Core().createSwitch<Any>()
+        } else {
+            factory.Core().createSwitchExpression<Any,Any>()
+        }
+        val subject = subjectVariable?.accept(this,null)?.single ?:
+            whenExpression.subject?.accept(this, null)?.single
+        if(subject != null) {
+            if(subjectVariable !is FirVariable<*>) {
+                ctSwitch.setSelector<CtAbstractSwitch<Any>>(expressionOrWrappedInStatementExpression(subject))
+            } else {
+                ctSwitch.putMetadata<CtAbstractSwitch<*>>(KtMetadataKeys.WHEN_SUBJECT_VARIABLE, subject)
+            }
+        }
+        ctSwitch.setCases<CtAbstractSwitch<Any>>(whenExpression.branches.map { visitWhenBranch(it, null).single })
+
+        return ctSwitch.compose()
+    }
+
+    override fun visitWhenBranch(whenBranch: FirWhenBranch, data: Nothing?): CompositeTransformResult.Single<CtCase<Any>> {
+        val case = factory.Core().createCase<Any>()
+        case.setCaseKind<CtCase<Any>>(CaseKind.ARROW)
+
+        fun markImplicitLHS(expr: CtElement) {
+            when(expr) {
+                is CtBinaryOperator<*> -> {
+                    when(expr.getMetadata(KtMetadataKeys.KT_BINARY_OPERATOR_KIND) as KtBinaryOperatorKind?) {
+                        KtBinaryOperatorKind.IS,
+                        KtBinaryOperatorKind.IS_NOT,
+                        KtBinaryOperatorKind.IN,
+                        KtBinaryOperatorKind.NOT_IN -> expr.leftHandOperand.setImplicit<CtBinaryOperator<*>>(true)
+                        else -> { /* Nothing */ }
+                    }
+                }
+            }
+        }
+
+        case.setCaseExpressions<CtCase<Any>>(helper.resolveWhenBranchMultiCondition(whenBranch).map {
+            it.first.accept(this,null).single.also { expr ->
+                expr.setParent(case)
+                if(it.second) markImplicitLHS(expr)
+            } as CtExpression<Any>
+        })
+
+        val result = visitBlock(whenBranch.result, null).single
+        case.addStatement<CtCase<*>>(result)
+        return case.compose()
     }
 
     override fun visitWhenSubjectExpression(
         whenSubjectExpression: FirWhenSubjectExpression,
         data: Nothing?
     ): CompositeTransformResult<CtElement> {
-        return whenSubjectExpression.whenSubject.whenExpression.subject!!.accept(this,null)
+        val subjectVariable = whenSubjectExpression.whenSubject.whenExpression.subjectVariable
+        if(subjectVariable != null) {
+            val read = factory.Core().createVariableRead<Any>()
+            read.setVariable<CtVariableRead<Any>>(referenceBuilder.getNewVariableReference<Any>(subjectVariable))
+            return read.compose()
+        }
+        // Subject has wrong type in typearg for its typeref, but it can be found in the actual type arg instead
+        val subject = whenSubjectExpression.whenSubject.whenExpression.subject
+        return subject?.accept(this,null) ?: CompositeTransformResult.empty()
     }
 
     private fun visitElvisOperator(whenExpression: FirWhenExpression): CompositeTransformResult<CtBinaryOperator<*>> {
@@ -520,7 +598,7 @@ class FirTreeBuilder(val factory : Factory, val session: FirSession) : FirVisito
         ...
        }
      */
-    override fun visitBlock(block: FirBlock, data: Nothing?): CompositeTransformResult<CtElement> {
+    override fun visitBlock(block: FirBlock, data: Nothing?): CompositeTransformResult.Single<CtBlock<*>> {
         if(block is FirSingleExpressionBlock) return visitSingleExpressionBlock(block)
         val ktBlock = factory.Core().createBlock<Any>()
         val statements = ArrayList<CtStatement>()
@@ -669,6 +747,12 @@ class FirTreeBuilder(val factory : Factory, val session: FirSession) : FirVisito
                 warn("Transformed parameter is not CtParameter")
             }
             else ctMethod.addParameter<CtMethod<Any>>(p)
+        }
+
+        // Add type parameters
+        if(function.typeParameters.isNotEmpty()) {
+            ctMethod.setFormalCtTypeParameters<CtMethod<*>>(
+                function.typeParameters.map { visitTypeParameter(it,null).single })
         }
 
         // Add body
@@ -839,6 +923,27 @@ class FirTreeBuilder(val factory : Factory, val session: FirSession) : FirVisito
         ctParam.setImplicit<CtParameter<*>>(valueParameter.psi == null)
 
         return ctParam.compose()
+    }
+
+    override fun visitTypeParameter(
+        typeParameter: FirTypeParameter,
+        data: Nothing?
+    ): CompositeTransformResult.Single<CtTypeParameter> {
+        val ctTypeParameter = factory.Core().createTypeParameter()
+        ctTypeParameter.setSimpleName<CtTypeParameter>(typeParameter.name.identifier)
+
+        // Don't include default upper bound ("Any?")
+        val refs = typeParameter.bounds.filterNot { it.isNullableAny }.map { referenceBuilder.getNewTypeReference<Any>(it) }
+        if(refs.size == 1) {
+            ctTypeParameter.setSuperclass<CtTypeParameter>(refs[0])
+        } else if(refs.size > 1) {
+            ctTypeParameter.setSuperclass<CtTypeParameter>(
+                factory.Type().createIntersectionTypeReferenceWithBounds<Any>(refs))
+        }
+
+        addModifiersAsMetadata(ctTypeParameter, KtModifierKind.fromTypeVariable(typeParameter))
+
+        return ctTypeParameter.compose()
     }
 
     override fun visitProperty(property: FirProperty, data: Nothing?): CompositeTransformResult<CtVariable<*>> {
