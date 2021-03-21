@@ -407,7 +407,14 @@ internal class IrTreeBuilder(
         if(expression.function.valueParameters.any { it.descriptor is ValueParameterDescriptorImpl.WithDestructuringDeclaration }) {
             visitLambdaWithDestructuredValueParam(ctLambda, expression.function, data)
         } else {
-            ctLambda.setBody<CtLambda<*>>(visitBody(expression.function.body!!,data).resultSafe)
+            val ctBody = visitBody(expression.function.body!!, data).resultSafe
+            if(ctBody.statements.size == 1) {
+                val expr = expression.function.body!!.statements[0]
+                if(expr is IrReturn && expr.endOffset - expr.startOffset <= 1) {
+                    ctBody.setImplicit<CtBlock<*>>(true)
+                }
+            }
+            ctLambda.setBody<CtLambda<*>>(ctBody)
             ctLambda.setParameters<CtLambda<Any>>(expression.function.valueParameters.map {
                 visitValueParameter(it, data).resultSafe
             })
@@ -532,16 +539,32 @@ internal class IrTreeBuilder(
     override fun visitDelegatingConstructorCall(
         expression: IrDelegatingConstructorCall,
         data: ContextData
-    ): DefiniteTransformResult<CtElement> {
+    ): DefiniteTransformResult<CtConstructorCall<*>> {
         val ctConstructorCall = core.createConstructorCall<Any>()
         ctConstructorCall.setExecutable<CtConstructorCall<Any>>(referenceBuilder.getNewDelegatingExecutableReference(expression))
 
         val valueArgs = ArrayList<CtExpression<*>>(expression.valueArgumentsCount)
         for(i in 0 until expression.valueArgumentsCount) {
-            val arg = expression.getValueArgument(i) ?: continue
-            val ctExpr = arg.accept(this, data).resultUnsafe
-            valueArgs.add(expressionOrWrappedInStatementExpression(ctExpr))
+            val irExpr = expression.getValueArgument(i) ?: continue
+
+            val name = getSourceHelper(data).getNamedArgumentIfAny(irExpr)
+            if(irExpr is IrVararg) {
+                val varargParams = visitVararg(irExpr, data).compositeResultSafe
+                if(varargParams.size == 1 && varargParams[0].getMetadata(KtMetadataKeys.SPREAD) == true) {
+                    if(name != null) {
+                        varargParams[0].putKtMetadata(KtMetadataKeys.NAMED_ARGUMENT, KtMetadata.string(name))
+                    }
+                }
+                valueArgs.addAll(varargParams)
+            } else {
+                val ctExpr = irExpr.accept(this, data).resultUnsafe
+                if(name != null) {
+                    ctExpr.putKtMetadata(KtMetadataKeys.NAMED_ARGUMENT, KtMetadata.string(name))
+                }
+                valueArgs.add(expressionOrWrappedInStatementExpression(ctExpr))
+            }
         }
+
         if(valueArgs.isNotEmpty()) {
             ctConstructorCall.setArguments<CtConstructorCall<Any>>(valueArgs)
         }
@@ -769,7 +792,13 @@ internal class IrTreeBuilder(
         } else {
             declaration.type
         }
-        ctParam.setType<CtParameter<Any>>(referenceBuilder.getNewTypeReference<Any>(type))
+        val implicitType = if(psi is KtParameter) {
+            psi.typeReference == null
+        }  else false
+        ctParam.setType<CtParameter<Any>>(referenceBuilder.getNewTypeReference<Any>(type).also {
+            it.setImplicit(implicitType || it.isImplicit)
+        })
+
 
         // Mark implicit for "it" in lambda
         //TODO
@@ -1109,13 +1138,23 @@ internal class IrTreeBuilder(
             : DefiniteTransformResult<CtInvocation<*>> {
         val invocation = core.createInvocation<Any>()
         invocation.setExecutable<CtInvocation<Any>>(referenceBuilder.getNewExecutableReference(irCall))
-
-
         val target = getReceiver(irCall, data) ?: getPossibleJavaReceiver(irCall)
-        if (target is CtExpression<*>) {
-            invocation.setTarget<CtInvocation<Any>>(target)
-        } else if (target != null) {
-            throw RuntimeException("Function call target not CtExpression")
+        if(target != null) {
+            invocation.setTarget<CtInvocation<Any>>(expressionOrWrappedInStatementExpression(target)) // Can be e.g. if-statement
+        }
+
+        if(irCall.origin == IrStatementOrigin.INVOKE) {
+            val dispatchReceiver = irCall.dispatchReceiver
+            if(dispatchReceiver is IrGetValue && dispatchReceiver.origin == IrStatementOrigin.VARIABLE_AS_FUNCTION) {
+                invocation.setTarget<CtInvocation<Any>>(null)
+                invocation.executable.setSimpleName<CtReference>(dispatchReceiver.symbol.descriptor.name.escaped())
+                invocation.executable.setDeclaringType<CtExecutableReference<Any>>(null)
+            } else {
+                invocation.putKtMetadata(
+                    KtMetadataKeys.INVOKE_AS_OPERATOR,
+                    KtMetadata.bool(true)
+                )
+            }
         }
 
         val arguments = ArrayList<CtExpression<*>>()
@@ -1151,11 +1190,30 @@ internal class IrTreeBuilder(
 
                 for(i in start until irCall.valueArgumentsCount) {
                     val irExpr = irCall.getValueArgument(i) ?: continue
+                    if(irExpr is IrMemberAccessExpression && irExpr.origin == IrStatementOrigin.PROPERTY_REFERENCE_FOR_DELEGATE) {
+                        invocation.setImplicit<CtInvocation<*>>(true)
+                    } else if (irExpr is IrGetValue) {
+                        val owner = irExpr.symbol.owner
+                        // Ignore safe receiver as argument
+                        if(owner is IrVariable && owner.name.asString().matches("^tmp\\d+_safe_receiver\$".toRegex())) {
+                            continue
+                        }
+                        if(owner.descriptor is ReceiverParameterDescriptor && irExpr.startOffset < irCall.startOffset) {
+                            continue
+                        }
+                    }
+                    val name = getSourceHelper(data).getNamedArgumentIfAny(irExpr)
                     if(irExpr is IrVararg) {
-                        arguments.addAll(visitVararg(irExpr, data).compositeResultSafe)
+                        val varargParams = visitVararg(irExpr, data).compositeResultSafe
+                        arguments.addAll(varargParams)
+                        if(varargParams.size == 1 && varargParams[0].getMetadata(KtMetadataKeys.SPREAD) == true) {
+                            if(name != null) {
+                                varargParams[0].putKtMetadata(KtMetadataKeys.NAMED_ARGUMENT, KtMetadata.string(name))
+                            }
+                        }
                     } else {
                         val ctExpr = irExpr.accept(this, data).resultUnsafe
-                        val name = getSourceHelper(data).getNamedArgumentIfAny(irExpr)
+
                         if(name != null) {
                             ctExpr.putKtMetadata(KtMetadataKeys.NAMED_ARGUMENT, KtMetadata.string(name))
                         }
@@ -1182,12 +1240,6 @@ internal class IrTreeBuilder(
             invocation.putKtMetadata(
                 KtMetadataKeys.INVOCATION_IS_INFIX,
                 KtMetadata.bool(helper.isInfixCall(irCall, data))
-            )
-        }
-        if(irCall.origin == IrStatementOrigin.INVOKE) {
-            invocation.putKtMetadata(
-                KtMetadataKeys.INVOKE_AS_OPERATOR,
-                KtMetadata.bool(true)
             )
         }
 
@@ -1219,7 +1271,9 @@ internal class IrTreeBuilder(
         })
         ctClass.transformAndAddAnnotations(declaration, data)
         ctClass.addModifiersAsMetadata(listOfNotNull(IrToModifierKind.convertVisibility(declaration.visibility)))
-        ctClass.putKtMetadata(KtMetadataKeys.TYPE_ALIAS, KtMetadata.element(referenceBuilder.getNewTypeReference<Any>(declaration.expandedType)))
+        ctClass.putKtMetadata(KtMetadataKeys.TYPE_ALIAS, KtMetadata.element(
+            referenceBuilder.getNewTypeReference<Any>(declaration.expandedType).also { it.setParent(ctClass) }
+        ))
         return ctClass.definite()
     }
 
@@ -1376,7 +1430,10 @@ internal class IrTreeBuilder(
             }
             IrStatementOrigin.ARGUMENTS_REORDERING_FOR_CALL -> {
                 val map = helper.getNamedArgumentsMap(block, data)
-                val call = block.statements.first { it is IrCall || it is IrConstructorCall } as IrFunctionAccessExpression
+                val call = block.statements.firstOrNull { it is IrCall || it is IrConstructorCall } as IrFunctionAccessExpression?
+                if(call == null) {
+                    return visitDelegatingConstructorCall(block.statements.firstIsInstance<IrDelegatingConstructorCall>(), data)
+                }
                 return createInvocation(call, data, map)
             }
             IrStatementOrigin.ELVIS -> {
@@ -1680,7 +1737,6 @@ internal class IrTreeBuilder(
             if(descriptor.name.asString().matches("tmp\\d+_this".toRegex())) {
                 return symbol.owner.initializer!!.accept(this,data) 
             }
-
         }
 
         val access = getThisAccessOrVariableRef(expression, data)

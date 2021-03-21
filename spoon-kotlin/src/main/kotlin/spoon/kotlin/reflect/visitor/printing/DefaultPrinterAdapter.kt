@@ -150,11 +150,15 @@ open class DefaultPrinterAdapter(
         else -> " : "
     })
 
-    infix fun writeModifiers(modifierSet : Set<KtModifierKind>?) : DefaultPrinterAdapter = writeModifiers(modifierSet?.toList())
+    infix fun writeModifiers(modifierSet : Set<KtModifierKind>?) : DefaultPrinterAdapter = writeModifiers(modifierSet?.toList(), this.ignoredModifiers)
+    fun writeModifiers(modifierSet : Set<KtModifierKind>?, ignoredModifiers: List<KtModifierKind>?) : DefaultPrinterAdapter =
+        writeModifiers(modifierSet?.toList(), ignoredModifiers)
 
-    infix fun writeModifiers(modifierList : List<KtModifierKind>?) : DefaultPrinterAdapter = this.apply {
-        modifierList?.filterNot { it in ignoredModifiers }?.sorted()?.nullOrNotEmpty()?.
-            joinToString(separator = " ", postfix = " ") { it.token }?.let { this.write(it) }
+    infix fun writeModifiers(modifierList : List<KtModifierKind>?) : DefaultPrinterAdapter = writeModifiers(modifierList, this.ignoredModifiers)
+
+    fun writeModifiers(modifierList : List<KtModifierKind>?, ignoredModifiers: List<KtModifierKind>?) : DefaultPrinterAdapter = this.apply {
+        modifierList?.filterNot { it in (ignoredModifiers ?: this.ignoredModifiers) }?.sorted()?.nullOrNotEmpty()?.
+        joinToString(separator = " ", postfix = " ") { it.token }?.let { this.write(it) }
     }
 
     infix fun writeIdentifier(name: String): DefaultPrinterAdapter {

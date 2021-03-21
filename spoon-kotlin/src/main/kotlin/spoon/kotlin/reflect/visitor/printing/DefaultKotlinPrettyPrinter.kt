@@ -76,8 +76,7 @@ class DefaultKotlinPrettyPrinter(
             if(this !is CtLambda<*>
                 || this.getBooleanMetadata(KtMetadataKeys.LAMBDA_AS_ANONYMOUS_FUNCTION, false)
                 || this.getMetadata(KtMetadataKeys.NAMED_ARGUMENT) as String? != null
-                || parent is CtConstructorCall<*>
-                || (parent is CtInvocation<*> && parent.executable.isConstructor) ) {
+                || parent is CtConstructorCall<*>) {
                 return false
             }
 
@@ -121,6 +120,12 @@ class DefaultKotlinPrettyPrinter(
     }
 
     private fun exitCtExpression(e: CtExpression<*>) {
+        if(e.getBooleanMetadata(KtMetadataKeys.ACCESS_IS_CHECK_NOT_NULL, false)) {
+            adapter write "!!"
+        }
+        if(e.getBooleanMetadata(KtMetadataKeys.IS_CLASS_REFERENCE, false)) {
+            adapter write "::class"
+        }
         if(e.typeCasts.isNotEmpty()) {
             e.typeCasts.forEach {
                 val token = if(it.getMetadata(KtMetadataKeys.TYPE_CAST_AS_SAFE) as Boolean) "as?"
@@ -131,12 +136,6 @@ class DefaultKotlinPrettyPrinter(
             adapter write ')'
         } else if(shouldAddPar(e)) {
             adapter write ')'
-        }
-        if(e.getBooleanMetadata(KtMetadataKeys.ACCESS_IS_CHECK_NOT_NULL, false)) {
-            adapter write "!!"
-        }
-        if(e.getBooleanMetadata(KtMetadataKeys.IS_CLASS_REFERENCE, false)) {
-            adapter write "::class"
         }
     }
 
@@ -577,7 +576,7 @@ class DefaultKotlinPrettyPrinter(
     }
 
     override fun <T : Enum<*>?> visitCtEnum(ctEnum: CtEnum<T>) {
-
+        adapter.ensureNEmptyLines(1)
         val modifiers = getModifiersMetadata(ctEnum)?.filterNot { it == KtModifierKind.OPEN }
         adapter writeModifiers modifiers
 
@@ -636,13 +635,15 @@ class DefaultKotlinPrettyPrinter(
         val numParams = typeRef.actualTypeArguments.size-1
         val params = typeRef.actualTypeArguments.subList(0, numParams)
         val returnType = typeRef.actualTypeArguments.last()
-        val wrapped = extensionFunctionType == null && shouldAddPar(typeRef)
+        val nullable = typeRef.getBooleanMetadata(KtMetadataKeys.TYPE_REF_NULLABLE, false)
+        val wrapped = nullable || (extensionFunctionType == null && shouldAddPar(typeRef))
+
+        if(wrapped) {
+            adapter write LEFT_ROUND
+        }
         if(extensionFunctionType != null) {
             visitCtTypeReference(extensionFunctionType, true)
             adapter write '.'
-        }
-        if(wrapped) {
-            adapter write LEFT_ROUND
         }
         adapter write LEFT_ROUND
         visitCommaSeparatedList(params)
@@ -650,6 +651,9 @@ class DefaultKotlinPrettyPrinter(
         returnType.accept(this)
         if(wrapped) {
             adapter write RIGHT_ROUND
+        }
+        if(nullable) {
+            adapter write '?'
         }
     }
 
@@ -1103,7 +1107,9 @@ class DefaultKotlinPrettyPrinter(
                 visitCommaSeparatedList(components) { adapter writeIdentifier it.simpleName }
                 adapter write RIGHT_ROUND
             }
-            return
+            if(param.parent.isParentInitialized && param.parent !is CtConstructor && param.parent !is CtMethod) {
+                return
+            }
         }
 
         if(writeAnnotations(param)) adapter.ensureSpaceOrNewlineBeforeNext()
@@ -1427,7 +1433,11 @@ class DefaultKotlinPrettyPrinter(
     }
 
     override fun <T : Any?> visitCtInvocation(invocation: CtInvocation<T>?) {
-        if(invocation == null || invocation.isImplicit) return
+        if(invocation == null) return
+        if(invocation.isImplicit) {
+            invocation.target?.accept(this)
+            return
+        }
         if(invocation.getMetadata(KtMetadataKeys.INVOCATION_IS_INFIX) as Boolean? == true) {
             return visitInfixInvocation(invocation)
         }
@@ -1436,7 +1446,7 @@ class DefaultKotlinPrettyPrinter(
 
         var separator = ""
         if(invocation.target != null && !invocation.target.isImplicit) {
-            invocation.target.accept(this)
+            invocation.target.accept(this) // TODO: Switch to visitTarget()
             val isSafe = invocation.getMetadata(KtMetadataKeys.ACCESS_IS_SAFE) as Boolean?
             separator = if(isSafe == true) "?." else "."
         }
@@ -1513,7 +1523,12 @@ class DefaultKotlinPrettyPrinter(
         val modifiers = modifierSet.filterIf(KtModifierKind.OVERRIDE in modifierSet) { it != KtModifierKind.OPEN }
             .filterIf(method.parent is CtInterface<*>) { it != KtModifierKind.ABSTRACT && it != KtModifierKind.OPEN }
 
-        adapter writeModifiers modifiers and "fun"
+        if(KtModifierKind.OVERRIDE in modifierSet) { // Don't ignore public if override, that can cause inconsistencies
+            adapter.writeModifiers(modifiers, listOf(KtModifierKind.FINAL))
+        } else {
+            adapter writeModifiers modifiers
+        }
+        adapter write "fun"
 
         val typeParamHandler = TypeParameterHandler.create(method, this, false)
         adapter write typeParamHandler.generateTypeParamListString() and SPACE

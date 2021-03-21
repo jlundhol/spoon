@@ -71,18 +71,16 @@ internal object LiteralToStringHelper {
         '\n' -> "\\n" //$NON-NLS-1$
         '\r' -> "\\r" //$NON-NLS-1$
         '\"' -> "\\\"" //$NON-NLS-1$
-        '\'' -> "\\'" //$NON-NLS-1$
+        //'\'' -> "\\'" //$NON-NLS-1$
         '\\' -> "\\\\" //$NON-NLS-1$
         '\$' -> "\\$"
         else -> if(Character.isISOControl(c)) String.format("\\u%04x", c.toInt()) else c.toString()
     }
 
     fun getStringLiteral(value : String) = with(StringBuilder()) {
-        value.forEach { c -> append(
-            getCharLiteral(
-                c
-            )
-        ) }
+        for (c in value) {
+            append(getCharLiteral(c))
+        }
         toString()
     }
 }

@@ -14,6 +14,7 @@ import org.jetbrains.kotlin.name.FqName
 import org.jetbrains.kotlin.name.Name
 import org.jetbrains.kotlin.resolve.DescriptorUtils
 import org.jetbrains.kotlin.resolve.calls.components.isVararg
+import org.jetbrains.kotlin.resolve.calls.inference.CapturedType
 import org.jetbrains.kotlin.types.*
 import org.jetbrains.kotlin.types.typeUtil.representativeUpperBound
 import spoon.kotlin.ktMetadata.KtMetadataKeys
@@ -27,8 +28,10 @@ internal class IrReferenceBuilder(private val irTreeBuilder: IrTreeBuilder) {
     private val helper get() = irTreeBuilder.helper
     private fun Name.escaped() = if(this.isSpecial) this.asString() else helper.escapedIdentifier(this)
 
-    private fun <T> getNewSimpleTypeReference(irType: IrSimpleType, resolveGenerics: Boolean): CtTypeReference<T> =
-        getNewTypeReference(irType.toKotlinType(), resolveGenerics)
+    private fun <T> getNewSimpleTypeReference(irType: IrSimpleType, resolveGenerics: Boolean): CtTypeReference<T> {
+        return getNewTypeReference<T>(irType.toKotlinType(), resolveGenerics)
+    }
+
 
     /**
      * Returns type references of all type arguments. If the type is an inner class with a wrapping (declaring) class that also
@@ -116,6 +119,7 @@ internal class IrReferenceBuilder(private val irTreeBuilder: IrTreeBuilder) {
         val (typeArgs, _) = visitTypeArguments(kotlinType)
         ctRef.setActualTypeArguments<CtTypeReference<*>>(typeArgs.drop(1))
         ctRef.putKtMetadata(KtMetadataKeys.EXTENSION_TYPE_REF, KtMetadata.element(typeArgs[0]))
+        ctRef.putKtMetadata(KtMetadataKeys.TYPE_REF_NULLABLE, KtMetadata.bool(kotlinType.isNullable()))
         return ctRef as CtTypeReference<T>
     }
 
@@ -124,18 +128,20 @@ internal class IrReferenceBuilder(private val irTreeBuilder: IrTreeBuilder) {
             return buildExtensionFunctionType(kotlinType as SimpleType, resolveGenerics)
         }
         val ctRef = when(kotlinType) {
-            is AbbreviatedType -> typeRefFromDescriptor(kotlinType.abbreviation.constructor.declarationDescriptor!!, resolveGenerics)
+            is CapturedType -> visitTypeProjection(kotlinType.typeProjection, resolveGenerics)
+            is AbbreviatedType -> getNewTypeReference(kotlinType.expandedType) //typeRefFromDescriptor(kotlinType.abbreviation.constructor.declarationDescriptor!!, resolveGenerics)
             is WrappedType -> typeRefFromDescriptor(kotlinType.unwrap().constructor.declarationDescriptor!!, resolveGenerics)
             is SimpleType -> typeRefFromDescriptor(kotlinType.constructor.declarationDescriptor!!, resolveGenerics)
             is FlexibleType -> getNewTypeReference(kotlinType.lowerBound, resolveGenerics)
         } as CtTypeReference<T>
         ctRef.putKtMetadata(KtMetadataKeys.TYPE_REF_NULLABLE, KtMetadata.bool(kotlinType.isMarkedNullable))
 
-        val (typeArgs, carry) = visitTypeArguments(if(kotlinType is AbbreviatedType) kotlinType.abbreviation else kotlinType)
+        val (typeArgs, carry) = visitTypeArguments(kotlinType)
         ctRef.setActualTypeArguments<CtTypeReference<*>>(typeArgs)
         if(kotlinType.constructor.declarationDescriptor != null) {
             if(DescriptorUtils.isLocal(kotlinType.constructor.declarationDescriptor!!)) {
                 ctRef.setSimpleName<CtTypeReference<*>>("1" + ctRef.simpleName)
+                ctRef.setImplicit<CtTypeReference<*>>(true)
             }
         }
         if(ctRef.simpleName.contains("[<>]".toRegex()) || kotlinType is FlexibleType) ctRef.setImplicit<CtTypeReference<*>>(true)
